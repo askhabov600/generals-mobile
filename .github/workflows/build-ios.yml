@@ -1,0 +1,185 @@
+name: Build iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle id on your Apple team (com.askhabov.generalszh)"
+        required: false
+        default: com.askhabov.generalszh
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    name: ios-vulkan
+    runs-on: macos-latest
+    timeout-minutes: 300
+    env:
+      VCPKG_COMMIT: "42e4e33e1505c9f47b58c21e0f557c1571b751ee"
+      VULKAN_VERSION: "1.4.341.1"
+    steps:
+      - name: Checkout iOS engine
+        uses: actions/checkout@v6
+        with:
+          repository: ammaarreshi/Generals-Mac-iOS-iPad
+          ref: main
+          fetch-depth: 1
+          submodules: false
+
+      - name: Checkout DXVK fork
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 references/fbraz3-dxvk
+          git -C references/fbraz3-dxvk submodule update --init --depth 1
+
+      - name: Install host tools
+        run: |
+          set -euo pipefail
+          brew update
+          brew install cmake ninja meson pkg-config glslang xcodegen autoconf autoconf-archive automake libtool
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
+          runVcpkgInstall: false
+
+      - name: Install Vulkan SDK (MoltenVK for iOS)
+        run: |
+          set -euo pipefail
+          VERSION="${VULKAN_VERSION}"
+          ZIP="/tmp/vulkansdk-macos-${VERSION}.zip"
+          URL="https://sdk.lunarg.com/sdk/download/${VERSION}/mac/vulkansdk-macos-${VERSION}.zip"
+          curl -fL --retry 3 --max-time 300 -o "$ZIP" "$URL"
+          rm -rf /tmp/vulkan-extract
+          mkdir -p /tmp/vulkan-extract "$HOME/VulkanSDK"
+          unzip -q "$ZIP" -d /tmp/vulkan-extract
+          EXE=$(find /tmp/vulkan-extract -name "vulkansdk-macOS-*" -type f | head -1)
+          test -n "$EXE"
+          chmod +x "$EXE"
+          INSTALL_TARGET="$HOME/VulkanSDK/${VERSION}"
+          "$EXE" --root "$INSTALL_TARGET" --accept-licenses --default-answer --confirm-command install
+          if [ -d "$INSTALL_TARGET/macOS" ]; then
+            VULKAN_SDK="$INSTALL_TARGET/macOS"
+          else
+            VULKAN_SDK="$INSTALL_TARGET"
+          fi
+          test -f "$VULKAN_SDK/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+          echo "VULKAN_SDK=$VULKAN_SDK" >> "$GITHUB_ENV"
+          rm -rf /tmp/vulkan-extract "$ZIP"
+
+      - name: Stage MoltenVK framework and fonts
+        run: |
+          set -euo pipefail
+          ./scripts/build/ios/fetch-moltenvk.sh
+          ./scripts/build/ios/stage-fonts.sh
+
+      - name: Configure
+        env:
+          VULKAN_SDK: ${{ env.VULKAN_SDK }}
+          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+        run: |
+          set -euo pipefail
+          cmake --preset ios-vulkan
+
+      - name: Build engine
+        run: |
+          set -euo pipefail
+          cmake --build build/ios-vulkan --target z_generals -j "$(sysctl -n hw.ncpu)"
+          test -f build/ios-vulkan/GeneralsMD/GeneralsXZH.app/GeneralsXZH
+
+      - name: Import Apple certificate
+        id: signing
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.APPLE_PROVISION_PROFILE_BASE64 }}
+          SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TEAM_ID}" ] || [ -z "${P12_BASE64}" ] || [ -z "${P12_PASSWORD}" ] || [ -z "${PROFILE_BASE64}" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Apple signing secrets are absent. The engine binary is built; the IPA is not signed."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "${P12_BASE64}" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "${PROFILE_BASE64}" | base64 --decode > "$RUNNER_TEMP/app.mobileprovision"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security cms -D -i "$RUNNER_TEMP/app.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/app.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+          IDENTITY="${SIGN_IDENTITY:-Apple Development}"
+          python3 - "$PROFILE_NAME" "$IDENTITY" <<'PY'
+          import pathlib, sys
+          profile, identity = sys.argv[1], sys.argv[2]
+          path = pathlib.Path("scripts/build/ios/package-ios-zh.sh")
+          text = path.read_text()
+          old = "    -allowProvisioningUpdates build | tail -3"
+          new = """    CODE_SIGN_STYLE=Manual \\
+              CODE_SIGN_IDENTITY=\"%s\" \\
+              PROVISIONING_PROFILE_SPECIFIER=\"%s\" \\
+              build | tail -40""" % (identity, profile)
+          if old not in text:
+              raise SystemExit("package script xcodebuild line not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "GX_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Package signed IPA
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          GX_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GX_BUNDLE_ID: ${{ inputs.bundle_id }}
+          GX_SIGN_IDENTITY: ${{ env.GX_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          ./scripts/build/ios/package-ios-zh.sh --dev
+          rm -rf Payload
+          mkdir Payload
+          cp -R build/ios-package/GeneralsXZH.app Payload/
+          zip -qry GeneralsXZH-ios.ipa Payload
+          ls -lh GeneralsXZH-ios.ipa
+
+      - name: Upload IPA
+        if: steps.signing.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsXZH-ios-ipa
+          path: GeneralsXZH-ios.ipa
+          retention-days: 14
+
+      - name: Upload unsigned engine
+        if: steps.signing.outputs.ready != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsXZH-ios-engine-unsigned
+          path: build/ios-vulkan/GeneralsMD/GeneralsXZH.app/GeneralsXZH
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## iOS build"
+            if [ "${{ steps.signing.outputs.ready }}" = "true" ]; then
+              echo "Signed IPA artifact: GeneralsXZH-ios-ipa"
+              echo "Bundle id: ${{ inputs.bundle_id }}"
+            else
+              echo "Engine compiled. IPA was not signed."
+              echo "Add APPLE_TEAM_ID, APPLE_CERTIFICATE_BASE64, APPLE_CERTIFICATE_PASSWORD, APPLE_PROVISION_PROFILE_BASE64, then run this workflow again."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
